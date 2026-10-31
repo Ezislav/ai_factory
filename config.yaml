@@ -1,0 +1,145 @@
+# Настройки ролика: тема, модули, их шаги, параметры промптов, нейросети и генераторы картинок и видео.
+
+# Тема ролика. Запуск: python run.py --project <имя папки ролика>.
+# Новая тема — новое имя папки, иначе программа остановится, чтобы не перезаписать готовый ролик.
+topic: Почему небо голубое
+
+# Модули по порядку. Готовы scenario, storyboard и images.
+pipeline:
+  - 01_scenario
+  - 02_storyboard
+  - 03_images
+  # - 04_voice
+  # - 05_montage
+
+modules:
+  01_scenario:
+    provider: openai              # нейросеть из llm.providers; null → llm.default
+    # Шаги по порядку: true — включён, false — выключен.
+    # generate и revise обязательные. Если выключить все проверки, revise просто примет черновик.
+    steps:
+      generate: true            # черновик
+      factcheck: false           # проверка фактов
+      youtube_policy: true      # проверка на правила YouTube
+      hook_check: false          # оценка хука
+      revise: true              # доработка по замечаниям → итоговый script.md
+    max_attempts: 3             # повторы, если проверка вернула некорректный JSON
+    step_settings: {}           # отдельная нейросеть на шаг, например: {factcheck: {provider: openai}}
+    params:                     # переменные для промптов 01_scenario/*.md
+      format: обычный ролик для YouTube (горизонтальное видео)
+      language: русский
+      duration_minutes: 1.5
+      words_per_minute: 140     # темп диктора; от него считается объём текста
+      tone: живой, разговорный, без канцелярита
+      audience: широкая аудитория без специальной подготовки
+      hook_seconds: 15
+      hook_min_score: 8         # ниже этой оценки хук переписывается на шаге revise
+      notes: ""                 # пожелания к конкретному ролику, удобно задавать через --set notes="..."
+      structure: |
+        1. Хук: интригующий вопрос или неожиданный факт, ради которого стоит досмотреть.
+        2. Короткое вступление: о чём ролик и что зритель узнает.
+        3. Основная часть: 3–6 смысловых блоков, каждый даёт новый факт или поворот.
+        4. Вывод: главная мысль в одной-двух фразах.
+        5. Призыв подписаться, связанный с темой ролика.
+
+  02_storyboard:
+    provider: openai              # нейросеть из llm.providers; null → llm.default
+    steps:
+      build: true               # сценарий → кадры: что на экране, время, план, камера, переход
+    max_attempts: 3             # повторы, если нейросеть пропустила фразы или вернула некорректный JSON
+    params:                     # переменные для промпта 02_storyboard/01_build.md
+      aspect_ratio: "16:9"
+      shot_seconds_min: 3       # обычная длительность кадра, секунды
+      shot_seconds_max: 8
+      max_phrase_words: 16      # длинные предложения режутся на фразы не длиннее (по запятым)
+      images_per_shot: 1        # сколько картинок сменяют друг друга в одном кадре (5_1.png, 5_2.png); 1 — одна (5.png)
+      image_seconds_min: 2      # каждая картинка на экране не меньше стольких секунд: в коротком кадре лишние отбрасываются
+      video_shots: 0            # сколько кадров нейросеть может сделать видео (media: video); 0 — только картинки
+      video_seconds_max: 8      # видео-кадр не длиннее — столько умеет генератор видео
+      # Темп диктора для расчёта времени берётся из 01_scenario → params → words_per_minute.
+
+  03_images:
+    image_provider: openai_image  # генератор из media.providers
+    video_provider: google_video
+    provider: openai              # нейросеть, которая проверяет картинки и переписывает промпты по вашим пожеланиям
+    steps:
+      generate: true            # картинка на каждый кадр → 03_images/1.png, 2.png, ...; готовые не переделываются,
+                                # кроме отмеченных в 03_images/redo.txt
+      review: true              # проверка картинок → 03_images/review.html (открыть в браузере) и подсказки в redo.txt
+      animate: false             # кадры с media: video → видео из картинки (1.mp4); нет таких — бесплатно
+    params:                     # стиль и описания кадров берутся из раскадровки, здесь — только как генерировать
+      limit: 3                  # пробный запуск: только первые N кадров, чтобы оценить стиль; 0 — все кадры
+      workers: 4                # сколько картинок генерировать одновременно
+      attempts: 3               # повторы при сбоях сети и лимитах
+      review_min_score: 7       # картинка с оценкой проверки ниже — плохая: подсвечена в отчёте и выписана в redo.txt
+
+  04_voice:
+    steps:
+      tts: true
+      
+  05_montage:
+    steps:                      # включите один из двух
+      ffmpeg: true
+      filmcraft: false
+
+# Нейросети. Модули и шаги ссылаются на них по имени (provider: claude).
+llm:
+  default: claude
+  providers:
+    claude:
+      type: anthropic
+      model: claude-opus-5-5
+      effort: high          # low | medium | high | xhigh | max
+      max_tokens: 32000
+      # Если модель откажется отвечать, запрос автоматически повторится на другой модели Claude.
+      # Чтобы отключить, удалите строку.
+      fallbacks: default
+      # Ключ: ANTHROPIC_API_KEY из .env (или профиль `ant auth login`).
+
+    openai:
+      type: openai
+      model: gpt-5.5        # укажите нужную модель
+      api_key_env: OPENAI_API_KEY
+
+    deepseek:               # любой OpenAI-совместимый API подключается так же, через base_url
+      type: openai
+      base_url: https://api.deepseek.com
+      model: deepseek-chat
+      api_key_env: DEEPSEEK_API_KEY
+
+    ollama:                 # локальная модель
+      type: openai
+      base_url: http://localhost:11434/v1
+      model: llama3.1
+      api_key: ollama
+
+    mock:                   # без сети и ключей — для проверки пайплайна
+      type: mock
+
+# Генераторы картинок и видео. Модули ссылаются на них по имени (image_provider: openai_image).
+# --provider mock при запуске подменяет их на mock_image и mock_video.
+media:
+  default_image: openai_image
+  default_video: google_video
+  providers:
+    openai_image:
+      type: openai_image
+      model: gpt-image-2      # укажите нужную модель
+      quality: medium         # low | medium | high — цена растёт с качеством
+      api_key_env: OPENAI_API_KEY
+
+    google_image:             # Imagen через Gemini API
+      type: google_image
+      model: imagen-4.0-generate-001
+      api_key_env: GOOGLE_API_KEY
+
+    google_video:             # Veo: видео из картинки кадра
+      type: google_video
+      model: veo-3.0-generate-001
+      duration_seconds: 8
+      api_key_env: GOOGLE_API_KEY
+
+    mock_image:               # без сети и ключей — однотонные картинки для проверки пайплайна
+      type: mock_image
+    mock_video:
+      type: mock_video
