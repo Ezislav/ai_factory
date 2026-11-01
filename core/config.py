@@ -57,6 +57,7 @@ def read_yaml(path: Path) -> dict:
 class Settings:
     data: dict[str, Any]
     provider_override: str | None = None  # --provider: одна нейросеть на весь запуск
+    step_by_step: bool = False  # --step: остановка после каждого этапа, пока автор не проверит результат
 
     @property
     def pipeline(self) -> list[str]:

@@ -3,6 +3,7 @@
 Модуль — папка в корне проекта с номером или без: 01_scenario/ или scenario/. Шаги — файлы в ней
 (см. core/step.py), их порядок и переключатели — modules → <NN_модуль> → steps в config.yaml ({шаг: true/false}).
 Шаг пропускается, если его OUTPUT уже есть. После пересчёта любого шага пересчитываются все следующие — в этом модуле и в следующих.
+В пошаговом режиме (--step) после каждого модуля программа ждёт автора: правки из redo.txt применяются, Enter — дальше.
 """
 
 from __future__ import annotations
@@ -14,16 +15,20 @@ import sys
 from pathlib import Path
 from types import ModuleType
 
-from core.config import PROJECT_ROOT, Settings, module_dir, step_file
+from core.config import PROJECT_ROOT, Settings, bare_name, module_dir, step_file
 from core.project import Project
-from core.step import PipelineError, ProviderFactory, ProviderPool, StepContext
+from core.step import OLD, REDO, PipelineError, ProviderFactory, ProviderPool, StepContext
 
-__all__ = ["PipelineError", "declared_steps", "load_step", "module_dir", "module_steps", "resolve_from", "run_pipeline"]
+__all__ = ["PipelineError", "PipelineStopped", "declared_steps", "load_step", "module_dir", "module_steps", "resolve_from", "resolve_only", "run_pipeline"]
 
 log = logging.getLogger(__name__)
 
 _loaded: dict[tuple[str, str], ModuleType] = {}
 _NUMBERED = re.compile(r"^(\d+)[._ -]*(.+)$")  # 02_storyboard → 02, storyboard
+
+
+class PipelineStopped(Exception):
+    """Автор остановил пошаговый режим."""
 
 
 def declared_steps(settings: Settings, module: str) -> dict[str, bool]:
@@ -90,12 +95,20 @@ def _numbered(parent: Path, number: str) -> list[tuple[str, Path]]:
 def _module_by_number(settings: Settings, number: str, value: str) -> str:
     folders = [(name, path) for name, path in _numbered(PROJECT_ROOT, number) if path.is_dir()]
     if not folders:
-        raise PipelineError(f"Начать с {value}: нет папки модуля с номером {number}")
+        raise PipelineError(f"Этап {value}: нет папки модуля с номером {number}")
     name, path = folders[0]
     if name not in settings.pipeline:
         raise PipelineError(
-            f"Начать с {value}: модуль {path.name} выключен — добавьте {path.name} в pipeline в config.yaml"
+            f"Этап {value}: модуль {path.name} выключен — добавьте {path.name} в pipeline в config.yaml"
         )
+    return name
+
+
+def resolve_only(settings: Settings, value: str) -> str:
+    """Этап для --only: по номеру папки (4) или по имени (audio, 04_audio)."""
+    name = _module_by_number(settings, value, value) if value.isdigit() else bare_name(value)
+    if name not in settings.pipeline:
+        raise PipelineError(f"--only {value}: такого этапа нет в pipeline в config.yaml")
     return name
 
 
@@ -145,37 +158,79 @@ def run_pipeline(
     *,
     from_: str | None = None,
     only: list[str] | None = None,
-    force: bool = False,
+    anew: bool = False,
     provider_factory: ProviderFactory | None = None,
 ) -> None:
-    for name in only or []:
-        if name not in settings.pipeline:
-            raise PipelineError(f"--only {name}: модуль не включён в pipeline в config.yaml")
+    """Без аргументов — продолжить: готовые шаги пропускаются. from_ — с этого места и до конца,
+    only — только эти модули, anew — с нуля: прежние результаты уходят в old/ ролика."""
+    only = [resolve_only(settings, name) for name in only or []]
     from_module, from_step = resolve_from(settings, from_) if from_ else (None, None)
 
     # Все шаги загружаются заранее, чтобы опечатка в config.yaml была видна до первого запроса к нейросети.
     modules = [module for module in settings.pipeline if not only or module in only]
     for module in modules:
         check_required(settings, module)
-    plan = [(module, step, load_step(module, step)) for module in modules for step in module_steps(settings, module)]
+    plan = {module: [(step, load_step(module, step)) for step in module_steps(settings, module)] for module in modules}
     providers = ProviderPool(settings, provider_factory)
 
-    forced, current = force, None
-    for module, step, code in plan:
-        if module != current:
-            log.info("=== %s ===", module)
-            current = module
-        if module == from_module and from_step in (None, step):
-            forced = True
-        output = project.path(module, code.OUTPUT)
-        ctx = StepContext(project, settings, module, step, module_steps(settings, module), providers)
-        done = code.done(ctx) if hasattr(code, "done") else is_done(output)
-        if done and not forced:
-            log.info("[%s.%s] пропуск — %s уже есть", module, step, output.relative_to(project.dir).as_posix())
+    if anew:
+        archive = project.archive()
+        if archive:
+            log.info("Прежние результаты перенесены в %s", archive)
+
+    forced = anew or bool(only)
+    waiting = from_module is not None  # до этапа, с которого просили начать, ничего не запускается
+    for number, (module, steps) in enumerate(plan.items(), 1):
+        if waiting and module != from_module:
+            log.info("=== %s === пропуск — начинаем с %s", module, from_)
             continue
-        log.info("[%s.%s] запуск", module, step)
-        try:
-            code.run(ctx)
-        except NotImplementedError as e:
-            raise PipelineError(f"[{module}.{step}] {e or 'ещё не реализован'}") from e
-        forced = True
+        log.info("=== %s ===", module)
+        while True:
+            for step, code in steps:
+                if waiting and from_step not in (None, step):
+                    continue
+                if waiting:
+                    waiting, forced = False, True
+                output = project.path(module, code.OUTPUT)
+                ctx = StepContext(project, settings, module, step, module_steps(settings, module), providers)
+                if not forced and (code.done(ctx) if hasattr(code, "done") else is_done(output)):
+                    log.info("[%s.%s] пропуск — %s уже есть", module, step, output.relative_to(project.dir).as_posix())
+                    continue
+                log.info("[%s.%s] запуск", module, step)
+                try:
+                    code.run(ctx)
+                except NotImplementedError as e:
+                    raise PipelineError(f"[{module}.{step}] {e or 'ещё не реализован'}") from e
+                forced = True
+                project.set_approved(module, False)
+            ensure_redo(ctx, steps)
+            if not settings.step_by_step or module in project.approved():
+                break
+            ask_author(ctx, steps, number, len(plan))
+            if not ctx.redo_lines():
+                project.set_approved(module, True)
+                break
+            # Правки: заново только то, что они затрагивают (шаги сами видят непустой redo.txt), и всё после этого.
+            forced = False
+
+
+def ensure_redo(ctx: StepContext, steps: list[tuple[str, ModuleType]]) -> None:
+    """Файл для правок появляется вместе с результатом модуля."""
+    help_text = next((code.REDO_HELP for _, code in steps if hasattr(code, "REDO_HELP")), None)
+    if help_text and not ctx.path(REDO).exists():
+        ctx.clear_redo(help_text)
+
+
+def ask_author(ctx: StepContext, steps: list[tuple[str, ModuleType]], number: int, total: int) -> None:
+    """Пауза пошагового режима. Enter — дальше; если в redo.txt есть правки, сначала применятся они."""
+    code = steps[-1][1]
+    print(f"\n=== Этап {number} из {total} готов: {module_dir(ctx.module).name} ===")
+    print(f"Проверьте:  {ctx.path(getattr(code, 'SHOW', code.OUTPUT))}")
+    print(f"Правки:     {ctx.path(REDO)}  (впишите и сохраните файл)")
+    print(f"Прежние варианты — в папке {OLD} рядом с результатом.")
+    try:
+        answer = input("Enter — далее (правки из redo.txt применятся сами), q — остановиться: ")
+    except EOFError:
+        raise PipelineStopped from None
+    if answer.strip().lower() in ("q", "й"):
+        raise PipelineStopped

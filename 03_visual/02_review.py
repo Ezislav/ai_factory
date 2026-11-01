@@ -1,4 +1,4 @@
-"""Проверка картинок: нейросеть смотрит на каждую картинку → 03_images/review.json, review.html и redo.txt.
+"""Проверка картинок: нейросеть смотрит на каждую картинку → 03_visual/review.json, review.html и redo.txt.
 
 Для каждой картинки нейросеть видит саму картинку, текст диктора кадра, описание сцены и стиль ролика,
 ставит оценку 1–10, перечисляет проблемы (не та сцена, дефекты, надписи, чужой стиль, правила YouTube)
@@ -24,10 +24,11 @@ from core.pipeline import load_step
 from core.step import PipelineError, StepContext
 from core.structured import StructuredOutputError
 
-generate = load_step("images", "generate")
+generate = load_step("visual", "generate")
 
 OUTPUT = generate.REVIEW
 PAGE = "review.html"
+SHOW = PAGE
 
 log = logging.getLogger(__name__)
 
@@ -158,7 +159,7 @@ def run(ctx: StepContext) -> None:
         ctx.module, ctx.step, len(ordered), min_score, len(bad),
         f", не проверены: {len(failed)}" if failed else "", ctx.path(PAGE),
     )
-    if not images.complete:
+    if not images.complete and not ctx.settings.step_by_step:
         raise PipelineError(
             generate.trial_message(ctx, len(images.shots), len(board.shots), len(ordered))
             + f". Отчёт проверки — {ctx.path(PAGE).relative_to(ctx.project.dir)}"

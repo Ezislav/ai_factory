@@ -1,12 +1,15 @@
-"""Генераторы-заглушки без сети и ключей: однотонная картинка и пустое «видео». Для проверки пайплайна."""
+"""Генераторы-заглушки без сети и ключей: однотонная картинка, пустое «видео» и писк вместо речи. Для проверки пайплайна."""
 
 from __future__ import annotations
 
 import hashlib
+import io
+import math
 import struct
+import wave
 import zlib
 
-from core.media.base import ImageProvider, Media, VideoProvider
+from core.media.base import AudioProvider, ImageProvider, Media, VideoProvider
 
 SIZES = {"16:9": (320, 180), "9:16": (180, 320), "1:1": (240, 240)}
 
@@ -37,3 +40,21 @@ class MockVideo(VideoProvider):
 
     def animate(self, image: bytes, prompt: str, aspect_ratio: str) -> Media:
         return Media(data=b"mock video: " + prompt.encode(), extension=".mp4", model="mock")  # не настоящий mp4
+
+
+class MockAudio(AudioProvider):
+    @property
+    def model(self) -> str:
+        return "mock"
+
+    def speak(self, text: str) -> Media:
+        rate = 16000
+        samples = int(rate * max(0.5, len(text.split()) * 60 / 140))  # длина как у речи в темпе 140 слов в минуту
+        tone = b"".join(struct.pack("<h", int(8000 * math.sin(2 * math.pi * 440 * i / rate))) for i in range(samples))
+        data = io.BytesIO()
+        with wave.open(data, "wb") as out:
+            out.setnchannels(1)
+            out.setsampwidth(2)
+            out.setframerate(rate)
+            out.writeframes(tone)
+        return Media(data=data.getvalue(), extension=".wav", model="mock")

@@ -1,4 +1,4 @@
-"""Общий интерфейс генераторов картинок и видео. Модули пайплайна работают только с ним."""
+"""Общий интерфейс генераторов картинок, видео и речи. Модули пайплайна работают только с ним."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from core.llm.base import api_key_from
 
 
 class MediaError(RuntimeError):
-    """Ошибка генерации картинки или видео (сеть, ключ, фильтр безопасности).
+    """Ошибка генерации картинки, видео или речи (сеть, ключ, фильтр безопасности).
 
     retry — есть смысл повторить тот же запрос (сбой сети, лимит); fatal — остальные кадры тоже не получатся (ключ).
     """
@@ -24,7 +24,7 @@ class MediaError(RuntimeError):
 @dataclass
 class Media:
     data: bytes
-    extension: str  # ".png", ".jpg", ".mp4" — по содержимому файла
+    extension: str  # ".png", ".jpg", ".mp4", ".wav" — по содержимому файла
     model: str
 
 
@@ -45,7 +45,7 @@ def mime_type(data: bytes) -> str:
 
 
 class MediaProvider(ABC):
-    kind = ""  # "image" или "video"
+    kind = ""  # "image", "video" или "audio"
 
     def __init__(self, name: str, config: dict[str, Any]):
         self.name = name
@@ -73,3 +73,11 @@ class VideoProvider(MediaProvider):
     @abstractmethod
     def animate(self, image: bytes, prompt: str, aspect_ratio: str) -> Media:
         """Видео, которое начинается с картинки image и развивается по описанию prompt."""
+
+
+class AudioProvider(MediaProvider):
+    kind = "audio"
+
+    @abstractmethod
+    def speak(self, text: str) -> Media:
+        """Текст диктора → речь."""

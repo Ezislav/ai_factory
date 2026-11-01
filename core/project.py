@@ -2,9 +2,10 @@
 
   01_scenario/       сценарий; 01_scenario/brief.yaml — тема и параметры ролика
   02_storyboard/     раскадровка
-  03_images/         изображения
-  04_voice/          озвучка
+  03_visual/         изображения
+  04_audio/          озвучка
   05_montage/        готовый ролик
+  old/               прежние результаты после запуска с нуля (--anew)
 
 Папка модуля появляется, когда модуль записывает в неё первый файл.
 """
@@ -27,6 +28,8 @@ from core.llm import LLMResponse
 
 BRIEF_MODULE, BRIEF = "scenario", "brief.yaml"  # тема и параметры лежат в папке сценария
 USAGE = "usage.jsonl"
+ARCHIVE = "old"  # прежние результаты после запуска с нуля
+APPROVED = "approved.json"  # этапы, которые автор проверил в пошаговом режиме
 _NAME_RE = re.compile(r"^[\w.-]+$")
 
 log = logging.getLogger(__name__)
@@ -80,7 +83,7 @@ class Project:
                     raise ProjectError(
                         f"Ролик '{name}' уже сделан на тему «{project.topic}», а в config.yaml тема «{topic}». "
                         f"Для нового ролика укажите другое имя: python run.py --project <новое_имя>. "
-                        f"Переделать '{name}' на новую тему с нуля: добавьте --force"
+                        f"Переделать '{name}' на новую тему с нуля: добавьте --anew"
                     )
                 log.info("Тема ролика изменена на «%s» — всё пересчитывается заново", topic)
                 project.topic = topic
@@ -102,6 +105,35 @@ class Project:
         path.parent.mkdir(parents=True, exist_ok=True)
         data = {"topic": self.topic, "params": self.params, "created_at": self.created_at}
         path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+    def archive(self) -> Path | None:
+        """Запуск с нуля: все результаты → old/<дата_время>/, ничего не удаляется. Тема и параметры (brief.yaml) остаются."""
+        target = self.dir / ARCHIVE / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        moved = False
+        (self.dir / APPROVED).unlink(missing_ok=True)
+        for folder in sorted(self.dir.iterdir()):
+            if not folder.is_dir() or folder.name == ARCHIVE:
+                continue
+            for item in sorted(folder.iterdir()):
+                if item == brief_path(self.dir):
+                    continue
+                (target / folder.name).mkdir(parents=True, exist_ok=True)
+                try:
+                    item.rename(target / folder.name / item.name)
+                except OSError as e:
+                    raise ProjectError(f"Не удалось перенести {item} в {target}: {e}. Закройте этот файл, если он открыт, и запустите ещё раз") from e
+                moved = True
+        return target if moved else None
+
+    def approved(self) -> set[str]:
+        path = self.dir / APPROVED
+        return set(json.loads(path.read_text(encoding="utf-8"))) if path.exists() else set()
+
+    def set_approved(self, module: str, approved: bool) -> None:
+        modules = self.approved()
+        if (module in modules) != approved:
+            modules = modules | {module} if approved else modules - {module}
+            (self.dir / APPROVED).write_text(json.dumps(sorted(modules)), encoding="utf-8")
 
     def path(self, module: str, *parts: str) -> Path:
         """Файл в папке модуля: path("scenario", "script.md") → projects/<имя>/01_scenario/script.md."""

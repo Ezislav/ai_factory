@@ -4,13 +4,13 @@
 # Новая тема — новое имя папки, иначе программа остановится, чтобы не перезаписать готовый ролик.
 topic: Почему небо голубое
 
-# Модули по порядку. Готовы scenario, storyboard и images.
+# Модули по порядку. Если убрать 04_audio, ролик соберётся без звука.
 pipeline:
   - 01_scenario
   - 02_storyboard
-  - 03_images
-  # - 04_voice
-  # - 05_montage
+  - 03_visual
+  - 04_audio
+  - 05_montage
 
 modules:
   01_scenario:
@@ -58,14 +58,14 @@ modules:
       video_seconds_max: 8      # видео-кадр не длиннее — столько умеет генератор видео
       # Темп диктора для расчёта времени берётся из 01_scenario → params → words_per_minute.
 
-  03_images:
+  03_visual:
     image_provider: openai_image  # генератор из media.providers
     video_provider: google_video
     provider: openai              # нейросеть, которая проверяет картинки и переписывает промпты по вашим пожеланиям
     steps:
-      generate: true            # картинка на каждый кадр → 03_images/1.png, 2.png, ...; готовые не переделываются,
-                                # кроме отмеченных в 03_images/redo.txt
-      review: true              # проверка картинок → 03_images/review.html (открыть в браузере) и подсказки в redo.txt
+      generate: true            # картинка на каждый кадр → 03_visual/1.png, 2.png, ...; готовые не переделываются,
+                                # кроме отмеченных в 03_visual/redo.txt
+      review: true              # проверка картинок → 03_visual/review.html (открыть в браузере) и подсказки в redo.txt
       animate: false             # кадры с media: video → видео из картинки (1.mp4); нет таких — бесплатно
     params:                     # стиль и описания кадров берутся из раскадровки, здесь — только как генерировать
       limit: 3                  # пробный запуск: только первые N кадров, чтобы оценить стиль; 0 — все кадры
@@ -73,14 +73,29 @@ modules:
       attempts: 3               # повторы при сбоях сети и лимитах
       review_min_score: 7       # картинка с оценкой проверки ниже — плохая: подсвечена в отчёте и выписана в redo.txt
 
-  04_voice:
+  04_audio:
+    audio_provider: lumean_audio  # генератор из media.providers
     steps:
-      tts: true
-      
+      tts: true                 # текст диктора → 04_audio/1.wav, 2.wav, ... и общая дорожка voice.wav
+    params:
+      workers: 2                # сколько кадров озвучивать одновременно; у Lumean на Cartesia — не больше 3
+      attempts: 3               # повторы при сбоях сети и лимитах
+      pause_seconds: 0.3        # пауза после кадра, где заканчивается предложение
+      block_pause_seconds: 0.7  # пауза между блоками сценария
+
   05_montage:
+    provider: openai              # нейросеть, которая вносит правки из 05_montage/redo.txt
     steps:                      # включите один из двух
-      ffmpeg: true
-      filmcraft: false
+      ffmpeg: false             # кадры, движение камеры, переходы → готовый ролик 05_montage/video.mp4
+      filmcraft: true           # то же → проект 05_montage/video.fcproj: открываете в FilmCraft, правите и выводите ролик сами
+    params:
+      height: 1080              # высота видео; ширина считается из aspect_ratio раскадровки
+      fps: 30
+      crf: 20                   # только ffmpeg. Качество: меньше — лучше и тяжелее файл (18–23 — разумно)
+      preset: medium            # только ffmpeg. Скорость сжатия: veryfast — быстрее и тяжелее файл, slow — медленнее и легче
+      camera_zoom: 1.12         # насколько камера приближает картинку при наезде и панораме
+      transition_seconds: 0.6   # длина наплыва и перехода через чёрное
+      workers: 4                # только ffmpeg. Сколько кадров собирать одновременно
 
 # Нейросети. Модули и шаги ссылаются на них по имени (provider: claude).
 llm:
@@ -116,11 +131,12 @@ llm:
     mock:                   # без сети и ключей — для проверки пайплайна
       type: mock
 
-# Генераторы картинок и видео. Модули ссылаются на них по имени (image_provider: openai_image).
-# --provider mock при запуске подменяет их на mock_image и mock_video.
+# Генераторы картинок, видео и речи. Модули ссылаются на них по имени (image_provider: openai_image).
+# --provider mock при запуске подменяет их на mock_image, mock_video и mock_audio.
 media:
   default_image: openai_image
   default_video: google_video
+  default_audio: lumean_audio
   providers:
     openai_image:
       type: openai_image
@@ -139,7 +155,15 @@ media:
       duration_seconds: 8
       api_key_env: GOOGLE_API_KEY
 
+    lumean_audio:             # озвучка; голос и движок задаются шаблоном в кабинете Lumean
+      type: lumean_audio
+      template_id: "01a197c8-42ee-73ea-93cc-696beb8ae83f"         # id шаблона озвучки из кабинета Lumean
+      audio_format: wav       # wav | mp3 | ogg
+      api_key_env: LUMEAN_API_KEY  # ключу нужны права orders.read, orders.write, orders.download
+
     mock_image:               # без сети и ключей — однотонные картинки для проверки пайплайна
       type: mock_image
     mock_video:
       type: mock_video
+    mock_audio:
+      type: mock_audio

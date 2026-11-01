@@ -1,9 +1,9 @@
-"""Видео из картинок: кадры с media: video → 03_images/1.mp4, ... и список videos.json.
+"""Видео из картинок: кадры с media: video → 03_visual/1.mp4, ... и список videos.json.
 
 Видео начинается с уже сгенерированной картинки кадра (01_generate), поэтому стиль ролика не ломается.
 Какие кадры будут видео, решает раскадровка: media: video (лимит — video_shots в 02_storyboard в config.yaml),
 можно поправить вручную в 02_storyboard/storyboard.json. Кадров с видео нет — шаг ничего не тратит.
-Как и картинки, готовое видео второй раз не генерируется — чтобы переделать, удалите его файл.
+Как и картинки, готовое видео второй раз не генерируется, если кадр не поменялся — чтобы переделать, удалите его файл.
 """
 
 import logging
@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from core.pipeline import load_step
 from core.step import PipelineError, StepContext
 
-generate = load_step("images", "generate")
+generate = load_step("visual", "generate")
 
 OUTPUT = "videos.json"
 
@@ -64,6 +64,11 @@ def run(ctx: StepContext) -> None:
     }
     provider = ctx.media("video")
     log.info("[%s.%s] видео: %d, генератор: %s (%s)", ctx.module, ctx.step, len(shots), provider.name, provider.model)
+
+    previous = ctx.read_json(OUTPUT, VideoSet)
+    for shot in previous.shots if previous else []:  # кадр поменялся — старое видео в old/, оно сделается заново
+        if prompts.get(shot.id) != shot.prompt and ctx.path(shot.file).exists():
+            ctx.keep_old(ctx.path(shot.file))
 
     def job(shot_id: int):
         image = ctx.path(image_files[shot_id]).read_bytes()

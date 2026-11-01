@@ -5,6 +5,8 @@
   run(ctx: StepContext) — сама работа.
 Необязательно: REQUIRED = True — шаг нельзя выключить в config.yaml.
               done(ctx) -> bool — шаг сам решает, готов ли он (вместо «файл OUTPUT уже есть»).
+              REDO_HELP — шаг принимает правки автора из redo.txt своего модуля; это шапка файла.
+              SHOW — какой файл показать автору в пошаговом режиме (по умолчанию OUTPUT).
 Промпт шага, если он нужен, лежит рядом: 01_scenario/02_factcheck.md.
 """
 
@@ -23,6 +25,8 @@ from core.prompts import load_prompt
 from core.structured import Check, ask_json, ask_text
 
 T = TypeVar("T", bound=BaseModel)
+REDO = "redo.txt"  # правки автора к результату модуля
+OLD = "old"  # папка для прежних вариантов
 ProviderFactory = Callable[[str | None], LLMProvider]
 
 
@@ -136,21 +140,50 @@ class StepContext:
             raise PipelineError(f"[{self.module}.{self.step}] нет файла {path} — его создаёт один из предыдущих шагов")
         return path.read_text(encoding="utf-8")
 
-    def write_bytes(self, name: str, data: bytes) -> Path:
+    def redo_lines(self) -> list[str]:
+        """Правки автора из redo.txt модуля: строки без комментариев (#)."""
+        path = self.path(REDO)
+        if not path.exists():
+            return []
+        lines = (line.split("#", 1)[0].strip() for line in path.read_text(encoding="utf-8-sig").splitlines())
+        return [line for line in lines if line]
+
+    def redo_items(self) -> dict[str, str]:
+        """Правки вида «5» и «5: пожелание» → {"5": "пожелание"}."""
+        items = {}
+        for line in self.redo_lines():
+            name, _, wish = line.partition(":")
+            items[name.strip().strip("\"'")] = wish.strip().strip("\"'")
+        return items
+
+    def clear_redo(self, text: str) -> None:
+        """Правки учтены — в redo.txt остаётся только шапка."""
+        self.write(REDO, text)
+
+    def keep_old(self, file: Path) -> None:
+        """5.png → old/5_v1.png рядом с файлом (v2, v3, ... — если уже переделывали)."""
+        folder = file.parent / OLD
+        folder.mkdir(exist_ok=True)
+        version = 1
+        while (folder / f"{file.stem}_v{version}{file.suffix}").exists():
+            version += 1
+        file.rename(folder / f"{file.stem}_v{version}{file.suffix}")
+
+    def write_bytes(self, name: str, data: bytes, module: str | None = None) -> Path:
         """Запись целиком или никак: при Ctrl+C или сбое не останется недописанного файла,
         который следующий запуск принял бы за готовый."""
-        path = self.path(name)
+        path = self.path(name, module)
         path.parent.mkdir(parents=True, exist_ok=True)
         temp = path.with_name(path.name + ".part")
         temp.write_bytes(data)
         temp.replace(path)
         return path
 
-    def write(self, name: str, text: str) -> Path:
-        return self.write_bytes(name, (text.strip() + "\n").encode("utf-8"))
+    def write(self, name: str, text: str, module: str | None = None) -> Path:
+        return self.write_bytes(name, (text.strip() + "\n").encode("utf-8"), module)
 
-    def write_json(self, name: str, model: BaseModel) -> Path:
-        return self.write_bytes(name, model.model_dump_json(indent=2).encode("utf-8"))
+    def write_json(self, name: str, model: BaseModel, module: str | None = None) -> Path:
+        return self.write_bytes(name, model.model_dump_json(indent=2).encode("utf-8"), module)
 
     def read_json(self, name: str, model_cls: type[T], module: str | None = None) -> T | None:
         path = self.path(name, module)

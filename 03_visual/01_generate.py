@@ -1,13 +1,14 @@
-"""Картинки для кадров раскадровки → 03_images/1.png, 2.png, ... и список images.json.
+"""Картинки для кадров раскадровки → 03_visual/1.png, 2.png, ... и список images.json.
 
 Сколько картинок в кадре, решает раскадровка (images_per_shot). Одна картинка — файл по номеру кадра (5.png),
 несколько — с номером картинки (5_1.png, 5_2.png): они сменяют друг друга внутри кадра.
 Картинка делается и для кадров с media: video — она станет первым кадром видео (шаг 03_animate).
-Готовая картинка никогда не генерируется второй раз — даже с --from и --force: если файл уже есть,
-он берётся как есть. Так оборванный запуск продолжается с места остановки, а деньги не тратятся повторно.
+Готовая картинка не генерируется второй раз, если описание её сцены не поменялось: файл берётся как есть.
+Так оборванный запуск продолжается с места остановки, а деньги не тратятся повторно. Если после новой
+раскадровки описание стало другим, картинка переделается сама, а старый файл уйдёт в 03_visual/old/.
 
-Переделать картинку: впишите её имя в 03_images/redo.txt (можно с пожеланием: «5: сделай закат ярче»)
-и запустите программу снова. Старый вариант уйдёт в 03_images/old/, новое описание сцены запомнится
+Переделать картинку: впишите её имя в 03_visual/redo.txt (можно с пожеланием: «5: сделай закат ярче»)
+и запустите программу снова. Старый вариант уйдёт в 03_visual/old/, новое описание сцены запомнится
 в fixes.json. Проще всего — после проверки (шаг 02_review): она сама предложит, что переделать.
 """
 
@@ -16,6 +17,7 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
+from pathlib import Path
 from typing import Callable, Literal
 
 from pydantic import BaseModel, Field
@@ -24,18 +26,22 @@ from core.llm import Image
 from core.media import Media, MediaError, MediaProvider
 from core.media.base import mime_type
 from core.pipeline import load_step
-from core.step import PipelineError, StepContext
+from core.step import OLD, REDO, PipelineError, StepContext
 
 storyboard = load_step("storyboard", "build")
 
 OUTPUT = "images.json"
 REQUIRED = True  # images.json — выход блока, его читают видео и монтаж
 IMAGE_EXTENSIONS = (".png", ".jpg", ".webp")
-REDO = "redo.txt"  # какие картинки переделать — заполняет автор
 FIXES = "fixes.json"  # новые описания сцен для переделанных картинок
 REVIEW = "review.json"  # отчёт проверки (шаг 02_review) — из него берутся советы для переделки
-OLD = "old"  # папка для прежних вариантов
 REDO_PROMPT = "01_redo.md"
+REDO_HELP = """# Какие картинки переделать. Одна строка — одна картинка: её имя без .png, после двоеточия — пожелание.
+#   5                         — переделать по совету проверки (или просто ещё раз, если замечаний нет)
+#   12_2: сделай закат ярче   — переделать с вашим пожеланием
+#   7                         — если в кадре несколько картинок (7_1, 7_2), переделаются все
+# Строки с # в начале не считаются. Старые варианты уйдут в папку old.
+"""
 
 FRAMING = {
     "wide": "wide shot",
@@ -59,6 +65,7 @@ class ShotImage(BaseModel):
 class ImageSet(BaseModel):
     aspect_ratio: str
     complete: bool = True  # false — пробный запуск (limit), картинки есть не для всех кадров
+    style: str = ""  # стиль раскадровки, с которым сделаны картинки
     shots: list[ShotImage]
 
 
@@ -182,6 +189,7 @@ def run(ctx: StepContext) -> None:
     redo = read_redo(ctx)
     if redo:
         apply_redo(ctx, board, redo, descriptions)
+    retire_changed(ctx, board, descriptions)
 
     prompts = {
         base: ctx.render_prompt(
@@ -208,6 +216,7 @@ def run(ctx: StepContext) -> None:
         ImageSet(
             aspect_ratio=board.aspect_ratio,
             complete=not trial,
+            style=board.style,
             shots=[
                 ShotImage(
                     id=shot.id,
@@ -220,23 +229,56 @@ def run(ctx: StepContext) -> None:
             ],
         ),
     )
-    if trial and "review" not in ctx.steps:  # иначе об этом скажет проверка — после того как посмотрит картинки
+    if trial and "review" not in ctx.steps and not ctx.settings.step_by_step:  # иначе об этом скажет проверка — после того как посмотрит картинки
         raise PipelineError(trial_message(ctx, len(shots), len(board.shots), len(files)))
 
 
 def trial_message(ctx: StepContext, done_shots: int, all_shots: int, images: int) -> str:
     return (
         f"Пробный запуск: готово кадров — {done_shots} из {all_shots} (картинок: {images}). Посмотрите их в папке "
-        f"{ctx.path('').relative_to(ctx.project.dir)}. Чтобы сделать остальные, поставьте limit: 0 в config.yaml"
+        f"{ctx.path('').relative_to(ctx.project.dir)}. Чтобы сделать остальные, поставьте limit: 0 в config.yaml. "
+        f"Собрать ролик только из готовых кадров: --only 4,5"
     )
 
 
 def done(ctx: StepContext) -> bool:
-    """Готово, если все картинки на месте, это не пробный запуск и в redo.txt ничего не отмечено."""
+    """Готово, если все картинки на месте и совпадают с раскадровкой, это не пробный запуск и в redo.txt ничего не отмечено."""
     images = ctx.read_json(OUTPUT, ImageSet)
-    if images is None or not images.complete or read_redo(ctx):
+    if images is None or read_redo(ctx):
+        return False
+    # В пошаговом режиме пробные кадры (limit) — законченный результат этапа: автор их уже смотрит.
+    trial = not images.complete and ctx.settings.step_by_step and len(images.shots) == ctx.params.get("limit", 0)
+    if not images.complete and not trial:
+        return False
+    board = read_storyboard(ctx)
+    descriptions = scene_descriptions(ctx, board)
+    if not trial and set(descriptions) != {Path(name).stem for shot in images.shots for name in shot.files}:
+        return False
+    if (images.style and images.style != board.style) or any(
+        descriptions.get(Path(name).stem) != old for shot in images.shots for name, old in zip(shot.files, shot.descriptions)
+    ):
         return False
     return all(ctx.path(name).exists() for shot in images.shots for name in shot.files)
+
+
+def retire_changed(ctx: StepContext, board, descriptions: dict[str, str]) -> None:
+    """Картинки, у которых поменялось описание сцены или стиль ролика, — в old/. Их кадры сразу убираются из images.json,
+    поэтому после оборванного запуска уже сделанная новая картинка не примется за старую."""
+    images = ctx.read_json(OUTPUT, ImageSet)
+    if images is None:
+        return
+    new_style = images.style and images.style != board.style
+    kept = []
+    for shot in images.shots:
+        changed = [name for name, old in zip(shot.files, shot.descriptions) if new_style or descriptions.get(Path(name).stem) != old]
+        for name in changed:
+            if ctx.path(name).exists():
+                ctx.keep_old(ctx.path(name))
+        if not changed:
+            kept.append(shot)
+    if len(kept) < len(images.shots):
+        log.info("[%s.%s] поменялись описания кадров: %d — их картинки переделаются", ctx.module, ctx.step, len(images.shots) - len(kept))
+        ctx.write_json(OUTPUT, ImageSet(aspect_ratio=images.aspect_ratio, complete=False, style=board.style, shots=kept))
 
 
 # --- Переделка: redo.txt → новые описания сцен, старые картинки → old/ ---
@@ -261,32 +303,17 @@ def read_fixes(ctx: StepContext) -> dict[str, dict[str, str]]:
 
 def read_redo(ctx: StepContext) -> dict[str, str]:
     """redo.txt: строки «5», «12_2: пожелание» или «5.png»; # — комментарий. → {имя без расширения: пожелание}."""
-    path = ctx.path(REDO)
-    if not path.exists():
-        return {}
     redo = {}
-    for line in path.read_text(encoding="utf-8-sig").splitlines():
-        line = line.split("#", 1)[0].strip()
-        if not line:
-            continue
-        name, _, wish = line.partition(":")
-        name = name.strip().strip("\"'")
+    for name, wish in ctx.redo_items().items():
         for ext in IMAGE_EXTENSIONS:
             name = name.removesuffix(ext)
-        redo[name] = wish.strip().strip("\"'")
+        redo[name] = wish
     return redo
 
 
 def write_redo(ctx: StepContext, suggestions: list[tuple[str, str]] = ()) -> None:
     """Шаблон redo.txt: подсказки проверки закомментированы — переделывается только то, что отметил автор."""
-    lines = [
-        "# Какие картинки переделать. Одна строка — одна картинка: её имя без .png, после двоеточия — пожелание.",
-        "#   5                         — переделать по совету проверки (или просто ещё раз, если замечаний нет)",
-        "#   12_2: сделай закат ярче   — переделать с вашим пожеланием",
-        "#   7                         — если в кадре несколько картинок (7_1, 7_2), переделаются все",
-        "# Строки с # в начале не считаются. Затем запустите программу снова — старые варианты уйдут в папку old.",
-        "",
-    ]
+    lines = [REDO_HELP]
     if suggestions:
         lines.append("# Проверке не понравились — уберите # в начале строки, чтобы переделать:")
         lines += [f"# {name}:    # {reason}" for name, reason in suggestions]
@@ -343,18 +370,8 @@ def apply_redo(ctx: StepContext, board, redo: dict[str, str], descriptions: dict
     ctx.write(FIXES, json.dumps(fixes, ensure_ascii=False, indent=2))
     for old_file in old_files.values():
         if old_file:
-            keep_old(ctx, old_file)
+            ctx.keep_old(old_file)
     write_redo(ctx)
-
-
-def keep_old(ctx: StepContext, file) -> None:
-    """5.png → old/5_v1.png (v2, v3, ... — если уже переделывали)."""
-    folder = ctx.path(OLD)
-    folder.mkdir(exist_ok=True)
-    version = 1
-    while (folder / f"{file.stem}_v{version}{file.suffix}").exists():
-        version += 1
-    file.rename(folder / f"{file.stem}_v{version}{file.suffix}")
 
 
 class RedoPrompt(BaseModel):

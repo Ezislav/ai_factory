@@ -3,13 +3,17 @@
 Текст диктора режется на короткие фразы и нумеруется. Нейросеть выбирает единый визуальный стиль
 ролика (style — его не нужно задавать в config.yaml), группирует фразы в кадры и для каждого
 придумывает, что на экране (по-русски и промпт для генератора по-английски), план, движение
-камеры, переход, титр и будет ли кадр видео (media: video — не больше video_shots на ролик).
+камеры, переход и будет ли кадр видео (media: video — не больше video_shots на ролик).
 В кадре может быть несколько картинок (images_per_shot) — они сменяют друг друга через равные промежутки,
 но каждая держится не меньше image_seconds_min секунд: в коротком кадре лишние отбрасываются. Начало, конец и
-длительность кадров считает код по числу слов и темпу диктора (words_per_minute из scenario) —
-после озвучки их можно будет уточнить по настоящим аудиофайлам.
+длительность кадров считает код по числу слов и темпу диктора (words_per_minute из scenario) — это оценка:
+итоговое время кадров монтаж берёт из настоящей озвучки (04_audio).
+
+Правки автора из 02_storyboard/redo.txt меняют только те кадры, которых касаются: их текст и время не трогаются,
+у остальных кадров останутся готовые картинки. Прежний вариант раскадровки уходит в 02_storyboard/old/.
 """
 
+import logging
 import re
 from dataclasses import dataclass
 from typing import Literal
@@ -23,12 +27,23 @@ SCRIPT = load_step("scenario", "revise").OUTPUT
 
 OUTPUT = "storyboard.json"
 PREVIEW = "storyboard.md"
+SHOW = PREVIEW
 REQUIRED = True  # storyboard.json — выход блока, его читают изображения, озвучка и монтаж
+REDO_PROMPT = "01_redo.md"
+REDO_HELP = """# Правки к раскадровке (storyboard.md). Пишите обычным языком, одна строка — одна правка:
+#   5: покажи закат над морем, план общий
+#   12: вместо наезда панорама вправо
+#   Сделай стиль всего ролика темнее
+# Текст диктора и границы кадров здесь не меняются: текст правится на этапе 1 или 4.
+# Строки с # в начале не считаются. Прежний вариант уйдёт в папку old.
+"""
 
 ShotType = Literal["wide", "medium", "close", "macro", "aerial"]
 Camera = Literal["static", "zoom_in", "zoom_out", "pan_left", "pan_right", "pan_up", "pan_down"]
 Transition = Literal["cut", "crossfade", "fade_black"]
 MediaKind = Literal["image", "video"]
+
+log = logging.getLogger(__name__)
 
 SHOT_LABELS = {"wide": "общий", "medium": "средний", "close": "крупный", "macro": "макро", "aerial": "с высоты"}
 CAMERA_LABELS = {
@@ -58,7 +73,6 @@ class ShotPlan(BaseModel):
     shot_type: ShotType = Field(description="План")
     camera: Camera = Field(description="Движение камеры по картинке")
     transition: Transition = Field(description="Переход к этому кадру от предыдущего")
-    on_screen_text: str = Field(description="Короткий титр на экране или пустая строка")
 
 
 class StoryboardPlan(BaseModel):
@@ -66,6 +80,26 @@ class StoryboardPlan(BaseModel):
 
     style: str = Field(description="Единый визуальный стиль всего ролика для генератора картинок, на английском")
     shots: list[ShotPlan]
+
+
+class ShotEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: int = Field(description="Номер кадра")
+    visual: str = Field(description="Что на экране: сюжет, объекты, фон, свет, ракурс — одно-два предложения")
+    image_prompts: list[str] = Field(description="Картинки кадра по порядку показа — подробные промпты на английском; столько же, сколько было")
+    media: MediaKind = Field(description="image — картинка с движением камеры, video — короткое видео из картинки")
+    motion: str = Field(description="Для video: что движется в кадре, на английском; для image — пустая строка")
+    shot_type: ShotType = Field(description="План")
+    camera: Camera = Field(description="Движение камеры по картинке")
+    transition: Transition = Field(description="Переход к этому кадру от предыдущего")
+
+
+class StoryboardEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    style: str = Field(description="Стиль ролика на английском; если правки его не касаются — прежний слово в слово")
+    shots: list[ShotEdit] = Field(description="Только изменившиеся кадры")
 
 
 # --- Итоговая раскадровка: то, что читают следующие модули ---
@@ -85,7 +119,6 @@ class Shot(BaseModel):
     shot_type: ShotType
     camera: Camera
     transition: Transition
-    on_screen_text: str = ""
 
     @model_validator(mode="before")
     @classmethod
@@ -120,8 +153,7 @@ class Storyboard(BaseModel):
             if shot.block != block:
                 block = shot.block
                 lines += ["", f"## {block}", "", "| № | Время | Текст диктора | Что на экране | План, камера | Переход |", "|---|---|---|---|---|---|"]
-            visual = shot.visual + (f"<br>**Титр:** {shot.on_screen_text}" if shot.on_screen_text else "")
-            visual += f"<br>**Видео:** {shot.motion}" if shot.media == "video" else ""
+            visual = shot.visual + (f"<br>**Видео:** {shot.motion}" if shot.media == "video" else "")
             if len(shot.image_prompts) > 1:
                 visual += f"<br>**Картинок:** {len(shot.image_prompts)}, по {shot.duration / len(shot.image_prompts):.1f} с"
             camera = f"{SHOT_LABELS[shot.shot_type]}, {CAMERA_LABELS[shot.camera]}"
@@ -239,7 +271,60 @@ def plan_checker(phrases: list[Phrase], max_seconds: float, video_shots: int, vi
     return check
 
 
+def save(ctx: StepContext, storyboard: Storyboard) -> None:
+    ctx.write_json(OUTPUT, storyboard, module="storyboard")
+    ctx.write(PREVIEW, storyboard.to_markdown(), module="storyboard")
+
+
+def done(ctx: StepContext) -> bool:
+    return ctx.path(OUTPUT).exists() and not ctx.redo_lines()
+
+
+def apply_redo(ctx: StepContext, wishes: list[str]) -> None:
+    """Правки автора → изменившиеся кадры. Текст и время кадров остаются прежними."""
+    board = ctx.read_json(OUTPUT, Storyboard)
+    shots = {shot.id: shot for shot in board.shots}
+    video_shots = ctx.params.get("video_shots", 0)
+
+    def check(edit: StoryboardEdit) -> None:
+        problems = []
+        for item in edit.shots:
+            if item.id not in shots:
+                problems.append(f"кадра {item.id} нет")
+            elif len(item.image_prompts) != max(1, len(shots[item.id].image_prompts)):
+                problems.append(f"в кадре {item.id} должно остаться промптов картинок: {max(1, len(shots[item.id].image_prompts))}")
+        media = {**{shot.id: shot.media for shot in board.shots}, **{item.id: item.media for item in edit.shots}}
+        if sum(kind == "video" for kind in media.values()) > max(video_shots, sum(shot.media == "video" for shot in board.shots)):
+            problems.append(f"видео-кадров можно не больше {video_shots}")
+        if problems:
+            raise ValueError("; ".join(problems))
+
+    system, user = ctx.render_prompt(template=REDO_PROMPT, wishes=wishes, style=board.style, shots=[shot.model_dump() for shot in board.shots])
+    edit = ctx.ask_json(system, user, StoryboardEdit, check=check)
+    updates = {item.id: item.model_dump(exclude={"id"}) for item in edit.shots}
+    changed = board.model_copy(update={
+        "style": edit.style.strip() or board.style,
+        "shots": [shot.model_copy(update=updates.get(shot.id, {})) for shot in board.shots],
+    })
+    for name in (OUTPUT, PREVIEW):
+        if ctx.path(name).exists():
+            ctx.keep_old(ctx.path(name))
+    save(ctx, changed)
+    ctx.clear_redo(REDO_HELP)
+    log.info("[%s.%s] правки внесены, изменилось кадров: %d", ctx.module, ctx.step, len(updates))
+
+
 def run(ctx: StepContext) -> None:
+    wishes = ctx.redo_lines()
+    board, script = ctx.path(OUTPUT), ctx.path(SCRIPT, "scenario")
+    # С правками раскадровка заново не строится — если только сценарий не новее её.
+    if not wishes or not board.exists() or (script.exists() and script.stat().st_mtime_ns > board.stat().st_mtime_ns):
+        build(ctx)
+    if wishes:
+        apply_redo(ctx, wishes)
+
+
+def build(ctx: StepContext) -> None:
     params = ctx.params
     words_per_minute = ctx.params_of("scenario").get("words_per_minute", 140)
     title, phrases = parse_script(ctx.read(SCRIPT, module="scenario"), words_per_minute, params.get("max_phrase_words", 16))
@@ -286,5 +371,4 @@ def run(ctx: StepContext) -> None:
         duration=round(start, 2),
         shots=shots,
     )
-    ctx.write_json(OUTPUT, storyboard)
-    ctx.write(PREVIEW, storyboard.to_markdown())
+    save(ctx, storyboard)
